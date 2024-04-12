@@ -1,0 +1,7 @@
+data/
+src/ui/venv
+logs/
+final_data/
+scripts/delete_files.sh
+
+*/venv/

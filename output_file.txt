@@ -1,0 +1,617 @@
+File Name: reader.h
+#ifndef READER_H
+#define READER_H
+
+#include <string>
+#include <vector>
+
+void calculateOffsets(const std::string& filePath, std::vector<long>& offsets);
+void distributeRecords(const std::string& filePath, int rank, int size, std::vector<std::string>& records);
+
+#endif // READER_H
+
+--------------------------------------------------------------------------------
+File Name: scalability.sh
+#!/bin/bash
+
+# Example for running the application with 1 to 8 processes
+for num_procs in {1..5}
+do
+    echo "Running with ${num_procs} processes:"
+    mpiexec -n ${num_procs} ./my_program
+done
+--------------------------------------------------------------------------------
+File Name: loader.h
+#ifndef LOADER_H
+#define LOADER_H
+
+#include <vector>
+#include <string>
+
+void processRecords(std::vector<std::string>& records, int rank);
+
+#endif // LOADER_H
+
+--------------------------------------------------------------------------------
+File Name: reader.cpp
+#include <iostream>
+#include <fstream>
+#include <mpi.h>
+#include <string>
+#include <vector>
+#include <sstream>
+#include "logger.h"
+
+// New function to calculate offsets
+void calculateOffsets(const std::string& filePath, std::vector<long>& offsets) {
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file for offset calculation.\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    offsets.push_back(0);  // The first record starts at offset 0
+    char c;
+    while (file.get(c)) {
+        if (c == '\n') {  // Assuming Unix-style line endings
+            // Save the position of the start of the next line
+            offsets.push_back(file.tellg());
+        }
+    }
+    file.close();
+}
+
+void distributeRecords(const std::string& filePath, int rank, int size, std::vector<std::string>& records) {
+    std::vector<long> allOffsets;
+    if (rank == 0) {
+        calculateOffsets(filePath, allOffsets);
+    }
+
+    // Number of records is one less than the number of offsets since the last offset marks the end of the file
+    int totalCount = allOffsets.size() - 1;
+
+    // Broadcast totalCount to all processes since it's needed for calculating ranges
+    MPI_Bcast(&totalCount, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Determine the range of records for this process
+    int recordsPerProcess = totalCount / size;
+    int remainingRecords = totalCount % size;
+
+    int startRecord = rank * recordsPerProcess + std::min(rank, remainingRecords);
+    int endRecord = startRecord + recordsPerProcess + (rank < remainingRecords ? 1 : 0);
+
+    // Now, distribute the offsets for only the required records to each process
+    long startOffset, endOffset;
+    if (rank == 0) {
+        // Send the specific starting and ending offsets to each process
+        for (int i = 0; i < size; i++) {
+            int startIdx = i * recordsPerProcess + std::min(i, remainingRecords);
+            int endIdx = startIdx + recordsPerProcess + (i < remainingRecords ? 1 : 0) - 1; // -1 because endIdx should be inclusive
+
+            long offsetsToSend[2] = {allOffsets[startIdx], allOffsets[endIdx + 1]}; // +1 to include the newline character of the last record
+            if (i == 0) {
+                startOffset = offsetsToSend[0];
+                endOffset = offsetsToSend[1];
+            } else {
+                MPI_Send(&offsetsToSend, 2, MPI_LONG, i, 0, MPI_COMM_WORLD);
+            }
+        }
+    } else {
+        long receivedOffsets[2];
+        MPI_Recv(&receivedOffsets, 2, MPI_LONG, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        startOffset = receivedOffsets[0];
+        endOffset = receivedOffsets[1];
+    }
+
+    std::ostringstream msg;
+    msg << "Process " << rank << " reading from offset " << startOffset << " to " << endOffset;
+    logMessage(msg.str(), rank);
+
+    // Each process reads its assigned portion of the file based on offsets
+    std::ifstream file(filePath, std::ios::binary);
+    file.seekg(startOffset);
+    std::string line;
+    while (file.tellg() < endOffset && std::getline(file, line)) {
+        records.push_back(line);
+    }
+
+    msg.str("");
+    msg << "Process " << rank << " finished reading. Total records read: " << records.size();
+    logMessage(msg.str(), rank);
+}
+
+--------------------------------------------------------------------------------
+File Name: logger.cpp
+// logger.cpp
+#include "logger.h"
+#include <fstream>
+#include <sstream>
+#include <iostream>
+
+void logMessage(const std::string& message, int rank) {
+    std::ostringstream filename;
+    filename << "log_process_" << rank << ".txt";
+    std::ofstream logFile(filename.str(), std::ios::app); // Append mode
+
+    if (logFile.is_open()) {
+        logFile << message << std::endl;
+        logFile.close();
+    } else {
+        std::cerr << "Failed to open log file for process " << rank << std::endl;
+    }
+}
+
+--------------------------------------------------------------------------------
+File Name: delete_files.sh
+#!/bin/bash
+
+# The directory to delete files from, provided as the first script argument
+DIRECTORY=$1
+
+# Check if directory path is provided
+if [ -z "$DIRECTORY" ]; then
+  echo "Usage: $0 <directory_path>"
+  exit 1
+fi
+
+# Check if the provided directory exists
+if [ ! -d "$DIRECTORY" ]; then
+  echo "Directory does not exist: $DIRECTORY"
+  exit 1
+fi
+
+# Array of filenames to delete
+declare -a files=("cleaned_data_rank_0.csv"
+                  "cleaned_data_rank_1.csv"
+                  "cleaned_data_rank_2.csv"
+                  "log_process_0.txt"
+                  "log_process_1.txt"
+                  "log_process_2.txt"
+                  "combined_cleaned_data.csv")
+
+# Loop through the array and delete each file
+for file in "${files[@]}"; do
+  filepath="$DIRECTORY/$file"
+  if [ -f "$filepath" ]; then
+    rm "$filepath"
+    echo "Deleted $filepath"
+  else
+    echo "File does not exist: $filepath"
+  fi
+done
+
+--------------------------------------------------------------------------------
+File Name: logger.h
+#ifndef LOGGER_H
+#define LOGGER_H
+
+#include <string>
+
+void logMessage(const std::string& message, int rank);
+
+#endif // LOGGER_H
+
+--------------------------------------------------------------------------------
+File Name: file_gen.py
+import os
+
+def write_contents_and_filenames_to_new_file(folder_path, output_file_path):
+    with open(output_file_path, 'w', encoding='utf-8') as output_file:
+        # Walk through all directories and files in the folder
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                # Skip if the file is a .txt file
+                if file.endswith('.csv'):
+                    continue
+                
+                file_path = os.path.join(root, file)
+                try:
+                    # Read the content of the current file
+                    with open(file_path, 'r', encoding='utf-8') as current_file:
+                        content = current_file.read()
+
+                    # Write the file name and its content to the output file
+                    output_file.write(f"File Name: {file}\n{content}\n")
+                    output_file.write("-" * 80 + "\n")  # Separator between files
+
+                except Exception as e:
+                    print(f"Could not process {file_path}: {e}")
+
+    print(f"Contents have been written to {output_file_path}")
+
+# Example usage
+folder_path = '/Users/spartan/Documents/SJSU/Sem2/CMPE-275/Mini2/Final_code/CMPE-275-HPC/src'  # Folder containing the files you want to process
+output_file_path = '/Users/spartan/Documents/SJSU/Sem2/CMPE-275/Mini2/Final_code/CMPE-275-HPC/output_file.txt'  # Path where you want to save the new file
+write_contents_and_filenames_to_new_file(folder_path, output_file_path)
+
+--------------------------------------------------------------------------------
+File Name: loader.cpp
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include "logger.h"
+#include <omp.h> // Include OpenMP for parallel processing
+#include <mpi.h>
+
+void processRecords(std::vector<std::string>& records, int rank) {
+    int numRecords = records.size();
+    std::vector<std::string> updatedRecords(numRecords);
+
+    std::ostringstream msg;
+
+    double processStartTime = MPI_Wtime();  // Start timing
+
+    msg<< "Starting time of processRecords: " << processStartTime  * 1000 << " seconds.";
+    logMessage(msg.str(), rank);
+    msg.str("");
+
+    msg << "Starting to process records in parallel. Total records: " << numRecords;
+    logMessage(msg.str(), rank);
+    msg.str("");
+
+    // Define the indices of the columns to be dropped
+    std::vector<int> columnsToDrop = {
+        0,1,2,3,6,7,8,9,10,11,12,14,15,16,17,18,19,20,22,23,25,26,27,28,29,
+        30,31,32,33,34,35,36,37,38,40,41,42
+    };
+
+    #pragma omp parallel for default(none) shared(records, updatedRecords, numRecords, rank, columnsToDrop)
+    for (int i = 0; i < numRecords; ++i) {
+        std::stringstream ss(records[i]);
+        std::string token;
+        std::vector<std::string> fields;
+        
+        // Split record into fields
+        while (getline(ss, token, ',')) {
+            fields.push_back(token);
+        }
+        
+        // Prepare to reconstruct the record without dropped columns
+        std::string reconstructedRecord;
+        for (size_t j = 0; j < fields.size(); ++j) {
+            // Skip columns marked to be dropped, casting `j` to `int`
+            if (std::find(columnsToDrop.begin(), columnsToDrop.end(), static_cast<int>(j)) != columnsToDrop.end()) {
+                continue;
+            }
+
+            // Append "NULL" for empty fields except for columns to be dropped
+            std::string fieldValue = fields[j].empty() ? "NULL" : fields[j];
+
+            // Construct the updated record
+            if (!reconstructedRecord.empty()) {
+                reconstructedRecord += ",";
+            }
+            reconstructedRecord += fieldValue;
+        }
+
+        updatedRecords[i] = reconstructedRecord;
+    }
+
+    records.swap(updatedRecords); // Update original records with processed ones
+
+    // Export the cleaned data to a CSV file
+    std::ofstream outputFile("cleaned_data_rank_" + std::to_string(rank) + ".csv");
+    if (outputFile.is_open()) {
+        for (const auto& record : records) {
+            outputFile << record << std::endl;
+        }
+        outputFile.close();
+        msg.str("");
+        msg << "Cleaned data exported to CSV file for rank: " + std::to_string(rank);
+        logMessage(msg.str(), rank);
+    } else {
+        msg.str("");
+        msg << "Failed to open CSV file for writing for rank: " + std::to_string(rank);
+        logMessage(msg.str(), rank);
+    }
+
+    // Log the end of processing
+    msg.str("");
+    msg << "Finished processing records in parallel. Total records processed: " << numRecords;
+    logMessage(msg.str(), rank);
+
+    double processEndTime = MPI_Wtime();  // End timing
+    double processTime = processEndTime - processStartTime;
+    msg.str("");
+    msg<< "Ending time of processRecords: " << processEndTime * 1000 << " seconds.";
+    logMessage(msg.str(), rank);
+    msg.str("");
+    msg << "Process " << rank << " processing time: " << processTime << " seconds.";
+    logMessage(msg.str(), rank);
+}
+--------------------------------------------------------------------------------
+File Name: main.cpp
+#include <mpi.h>
+#include <fstream>
+#include <iostream>
+#include <vector>
+#include <string>
+#include "reader.h"
+#include "loader.h"
+#include "logger.h"
+#include <iostream>
+
+int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+    double startTime = MPI_Wtime();
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    logMessage("MPI Initialized.", rank);
+
+    std::vector<std::string> records;
+    std::string filePath = "../data/Parking_Violations_Issued_-_Fiscal_Year_2024_20240405.csv"; 
+
+    distributeRecords(filePath, rank, size, records);
+    processRecords(records, rank);
+
+    // Ensures all processes have finished processing
+    MPI_Barrier(MPI_COMM_WORLD); 
+
+    if (rank == 0) {
+        std::ofstream combinedFile("combined_cleaned_data.csv");
+        for (int i = 0; i < size; i++) {
+            std::string filename = "cleaned_data_rank_" + std::to_string(i) + ".csv";
+            // std::string filename = "cleaned_data_process_" + std::to_string(i) + ".csv";
+            std::ifstream inputFile(filename);
+            if (inputFile.is_open()) {
+                combinedFile << inputFile.rdbuf();
+                inputFile.close();
+            } else {
+                logMessage("Failed to open file: " + filename + " for combining.", rank);
+            }
+        }
+        combinedFile.close();
+        logMessage("All processed data combined into a single file.", rank);
+    }
+
+    logMessage("Finalizing MPI.", rank);
+
+    double endTime = MPI_Wtime();  // End timing
+    double executionTime = endTime - startTime;
+    if (rank == 0) {
+        std::cout << "Total Execution Time: " << executionTime << " seconds." << std::endl;
+    }
+
+    MPI_Finalize();
+
+    return 0;
+}
+
+--------------------------------------------------------------------------------
+File Name: app.py
+import io
+import pandas as pd
+import matplotlib.pyplot as plt
+from flask import Flask, send_file, render_template_string
+import matplotlib
+matplotlib.use('Agg')  # This line is crucial for non-GUI backend
+app = Flask(__name__)
+
+# Load your CSV data
+# Assuming this file path is accessible, adjust accordingly or use an uploaded file method
+df = pd.read_csv('processed.csv', low_memory=False)
+
+
+@app.route('/')
+def index():
+    # HTML content with links to the plot sections
+    return '''
+    <html>
+        <head>
+            <title>Plot Server</title>
+        </head>
+        <body>
+            <h1>Welcome to the Plot Server!</h1>
+            <p>Select a category to view related plots:</p>
+            <ul>
+                <li><a href="/timeplot">Time Analysis</a></li>
+                <li><a href="/geoplot">Geographic Analysis</a></li>
+            </ul>
+        </body>
+    </html>
+    '''
+
+
+@app.route('/timeplot')
+def timeplot():
+    # HTML template for displaying time analysis plots and explanations
+    time_analysis_html = '''
+    <html>
+        <head>
+            <title>Time Analysis Plots</title>
+        </head>
+        <body>
+            <h1>Time Analysis Plots</h1>
+            <!-- Placeholders for plot images and explanations -->
+            <div>
+    <h2>Monthly Analysis</h2>
+    <img src="/time/month" alt="Monthly Violations Plot">
+    <p>Brief explanation of violations by month.</p>
+</div>
+<div>
+    <h2>Weekly Analysis</h2>
+    <img src="/time/week" alt="Weekly Violations Plot">
+    <p>Brief explanation of violations by week number.</p>
+</div>
+<div>
+    <h2>Daily Analysis</h2>
+    <img src="/time/day" alt="Daily Violations Plot">
+    <p>Brief explanation of violations by day of the week.</p>
+</div>
+
+            <a href="/">Back to Homepage</a>
+        </body>
+    </html>
+    '''
+    return render_template_string(time_analysis_html)
+
+
+@app.route('/geoplot')
+def geoplot():
+    # HTML template for displaying geographic analysis plots and explanations
+    geo_analysis_html = '''
+    <html>
+        <head>
+            <title>Geographic Analysis Plots</title>
+        </head>
+        <body>
+            <h1>Geographic Analysis Plots</h1>
+            <!-- Placeholders for plot images and explanations -->
+            <div>
+                <h2>Violation Location Analysis</h2>
+                <img src="/geo/location" alt="Violation Location Analysis Plot">
+                <p>Brief explanation of the Violation Location Analysis Plot.</p>
+            </div>
+            <div>
+                <h2>Borough Comparison</h2>
+                <img src="/geo/borough" alt="Borough Comparison Plot">
+                <p>Brief explanation of the Borough Comparison Plot.</p>
+            </div>
+            <a href="/">Back to Homepage</a>
+        </body>
+    </html>
+    '''
+    return render_template_string(geo_analysis_html)
+
+
+def serve_pil_image(pil_img):
+    img_io = io.BytesIO()
+    pil_img.save(img_io, 'PNG', quality=70)
+    img_io.seek(0)
+    return send_file(img_io, mimetype='image/png')
+
+# Trend Analysis: Monthly, Weekly, Daily
+
+
+@app.route('/time/month')
+def plot_month():
+    local_df = df.copy()
+    local_df['Issue Date'] = pd.to_datetime(
+        local_df['Issue Date'], errors='coerce')
+    # Filter out NaT values
+    local_df = local_df.dropna(subset=['Issue Date'])
+    local_df['Month'] = local_df['Issue Date'].dt.month
+    monthly_counts = local_df.groupby('Month').size()
+
+    fig, ax = plt.subplots()
+    monthly_counts.plot(kind='bar', ax=ax)
+    ax.set_title('Violations by Month')
+    ax.set_xlabel('Month')
+    ax.set_ylabel('Number of Violations')
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close(fig)
+    return send_file(buf, mimetype='image/png')
+
+
+@app.route('/time/week')
+def plot_week():
+    local_df = df.copy()
+    local_df['Issue Date'] = pd.to_datetime(
+        local_df['Issue Date'], errors='coerce')
+    # Filter out NaT values
+    local_df = local_df.dropna(subset=['Issue Date'])
+    local_df['Week'] = local_df['Issue Date'].dt.isocalendar().week
+    weekly_counts = local_df.groupby('Week').size()
+
+    fig, ax = plt.subplots()
+    weekly_counts.plot(kind='bar', ax=ax)
+    ax.set_title('Violations by Week Number')
+    ax.set_xlabel('Week Number')
+    ax.set_ylabel('Number of Violations')
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close(fig)
+    return send_file(buf, mimetype='image/png')
+
+
+@app.route('/time/day')
+def plot_day():
+    local_df = df.copy()
+    local_df['Issue Date'] = pd.to_datetime(
+        local_df['Issue Date'], errors='coerce')
+    # Filter out NaT values
+    local_df = local_df.dropna(subset=['Issue Date'])
+    local_df['Day'] = local_df['Issue Date'].dt.dayofweek
+    daily_counts = local_df.groupby('Day').size()
+
+    fig, ax = plt.subplots()
+    daily_counts.plot(kind='bar', ax=ax)
+    ax.set_title('Violations by Day of the Week')
+    ax.set_xlabel('Day of the Week (0=Monday, 6=Sunday)')
+    ax.set_ylabel('Number of Violations')
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close(fig)
+    return send_file(buf, mimetype='image/png')
+
+# Geographic Analysis: Locations, Streets, Boroughs
+
+
+@app.route('/geo/location')
+def plot_location():
+    top_locations = df['Violation Location'].value_counts().head(10)
+
+    fig, ax = plt.subplots()
+    top_locations.plot(kind='bar', ax=ax)
+    ax.set_title('Top 10 Violation Locations')
+    ax.set_xlabel('Location')
+    ax.set_ylabel('Number of Violations')
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close(fig)
+    return send_file(buf, mimetype='image/png')
+
+
+@app.route('/geo/street')
+def plot_street():
+    top_streets = df['Street Name'].value_counts().head(10)
+
+    fig, ax = plt.subplots()
+    top_streets.plot(kind='bar', ax=ax)
+    ax.set_title('Top 10 Violation Streets')
+    ax.set_xlabel('Street Name')
+    ax.set_ylabel('Number of Violations')
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close(fig)
+    return send_file(buf, mimetype='image/png')
+
+
+@app.route('/geo/borough')
+def plot_borough():
+    top_boroughs = df['Violation County'].value_counts().head(10)
+
+    fig, ax = plt.subplots()
+    top_boroughs.plot(kind='bar', ax=ax)
+    ax.set_title('Top 10 Violation Boroughs')
+    ax.set_xlabel('Borough')
+    ax.set_ylabel('Number of Violations')
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close(fig)
+    return send_file(buf, mimetype='image/png')
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+--------------------------------------------------------------------------------
